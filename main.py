@@ -1,166 +1,315 @@
 #!/usr/bin/env python3
-"""Deterministic EMA trend-following bot for the make.fun btc-race-24h bounty.
+"""cbBTC bars-replay/v1 bot: EMA(20)/EMA(60) trend-follow with ATR(14) trailing stop.
 
-Reads one JSON bar (1-minute OHLCV) per line on stdin and writes exactly one
-JSON order line per bar on stdout. Standard library only; no network access,
-no wall clock, no filesystem reads, no randomness -- the same input stream
-always produces byte-identical output.
-
-Strategy: long-only EMA(20)/EMA(60) crossover with a Wilder ATR(14) trailing
-stop and a 2% hard stop. See README.md for the full contract.
+Speaks agent-fun/bars-replay/v1 over stdin/stdout, one JSON line at a time:
+hello (capture symbols/capital/caps/fees/warmup), then exactly one reply per
+batch echoing its seq, then done (flush, exit 0, no reply). Standard library
+only, deterministic: no clock, no environment, no randomness, no filesystem
+access, no dict-order dependence in the output.
 """
-
 import json
 import sys
 
-FAST_PERIOD = 20
-SLOW_PERIOD = 60
-ATR_PERIOD = 14
-WARMUP_BARS = SLOW_PERIOD + ATR_PERIOD  # 74 bars before any trade is allowed
-ENTRY_FRACTION = 0.35  # fraction of equity deployed on each entry
-TRAIL_MULTIPLE = 2.0   # trailing stop distance, in ATR multiples
-HARD_STOP_PCT = 0.02   # 2% hard stop below the entry price
-START_EQUITY = 1000.0
+PROTOCOL = "agent-fun/bars-replay/v1"
+FAST = 20
+SLOW = 60
+ATR_N = 14
+WARM_BARS = SLOW + ATR_N
+SIZE_NUM = 35
+SIZE_DEN = 100
+TRAIL_ATR = 2.0
+HARD_STOP = 0.02
+MAX_SLIPPAGE_BPS = 100
+BPS = 10000
+
+
+def _as_int(value, default):
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v > 1e308 or v < -1e308:
+        return None
+    return v
 
 
 class Ema:
-    """Exponential moving average seeded with the SMA of the first `period`
-    values. Updated incrementally, one value at a time."""
+    """EMA seeded with the SMA of its first `period` closes; None until seeded."""
 
     def __init__(self, period):
         self.period = period
-        self.alpha = 2.0 / (period + 1.0)
-        self.count = 0
-        self._seed_sum = 0.0
-        self.value = 0.0
+        self.alpha = 2.0 / (period + 1)
+        self._warm = []
+        self.value = None
 
     def update(self, x):
-        self.count += 1
-        if self.count <= self.period:
-            # Still seeding: average of everything seen so far. Once the
-            # window is full this is exactly the SMA of the first `period`
-            # values, which then anchors all later EMA updates.
-            self._seed_sum += x
-            self.value = self._seed_sum / self.count
+        if self.value is not None:
+            self.value += self.alpha * (x - self.value)
         else:
-            self.value = self.alpha * x + (1.0 - self.alpha) * self.value
+            self._warm.append(x)
+            if len(self._warm) >= self.period:
+                self.value = sum(self._warm) / len(self._warm)
+                self._warm = []
         return self.value
 
 
 class WilderAtr:
-    """Wilder ATR: true range averaged over the first `period` ranges, then
-    smoothed as a = (a * (period - 1) + tr) / period."""
+    """Wilder ATR seeded with the mean of its first `period` true ranges."""
 
     def __init__(self, period):
         self.period = period
-        self.count = 0
-        self._seed_sum = 0.0
-        self.value = 0.0
-        self.prev_close = None
+        self._trs = []
+        self.value = None
+        self._prev_c = None
 
-    def update(self, high, low, close):
-        if self.prev_close is None:
-            # First bar has no previous close, hence no true range yet.
-            self.prev_close = close
-            return self.value
-        tr = max(high - low,
-                 abs(high - self.prev_close),
-                 abs(low - self.prev_close))
-        self.prev_close = close
-        self.count += 1
-        if self.count <= self.period:
-            self._seed_sum += tr
-            self.value = self._seed_sum / self.count
-        else:
+    def update(self, h, l, c):
+        if self._prev_c is None:
+            self._prev_c = c
+            return None
+        tr = max(h - l, abs(h - self._prev_c), abs(l - self._prev_c))
+        self._prev_c = c
+        if self.value is not None:
             self.value = (self.value * (self.period - 1) + tr) / self.period
+        else:
+            self._trs.append(tr)
+            if len(self._trs) >= self.period:
+                self.value = sum(self._trs) / len(self._trs)
+                self._trs = []
         return self.value
 
 
 class Bot:
-    """Holds the indicator state, the simulated account, and the open
-    position. One instance processes the whole bar stream, in order."""
+    def __init__(self):
+        self.symbol = "CBBTC"
+        self.price_scale = 5
+        self.qty_scale = 8
+        self.quote_scale = 6
+        self.warmup_bars = 0
+        self.max_orders = 1
+        self.max_weight_bps = BPS
+        self.min_notional = 0
+        self.fast = Ema(FAST)
+        self.slow = Ema(SLOW)
+        self.atr = WilderAtr(ATR_N)
+        self.n_bars = 0
+        self.gap_prev = None
+        self.entry_close = None
+        self.peak = None
+        self._next_id = 1
 
-    def __init__(self, starting_cash=START_EQUITY):
-        self.cash = starting_cash
-        self.position = 0.0
-        self.entry_price = None
-        self.peak_close = None  # highest close seen since entry (trailing)
-        self.fast = Ema(FAST_PERIOD)
-        self.slow = Ema(SLOW_PERIOD)
-        self.atr = WilderAtr(ATR_PERIOD)
-        self.bars_seen = 0
-        self.prev_fast = None
-        self.prev_slow = None
+    def on_hello(self, msg):
+        try:
+            symbols = msg.get("symbols")
+            if isinstance(symbols, list) and symbols:
+                s0 = symbols[0]
+                if isinstance(s0, dict):
+                    name = s0.get("symbol")
+                    if isinstance(name, str) and name:
+                        self.symbol = name
+                    self.price_scale = max(0, _as_int(s0.get("price_scale"), self.price_scale))
+                    self.qty_scale = max(0, _as_int(s0.get("qty_scale"), self.qty_scale))
+            capital = msg.get("capital")
+            if isinstance(capital, dict):
+                self.quote_scale = max(0, _as_int(capital.get("quote_scale"), self.quote_scale))
+            caps = msg.get("caps")
+            if isinstance(caps, dict):
+                self.max_orders = max(0, _as_int(caps.get("max_orders_per_bar"), self.max_orders))
+                self.max_weight_bps = max(0, _as_int(caps.get("max_weight_bps"), self.max_weight_bps))
+            fees = msg.get("fees")
+            if isinstance(fees, dict):
+                self.min_notional = max(0, _as_int(fees.get("min_notional_quote_units"), self.min_notional))
+            self.warmup_bars = max(0, _as_int(msg.get("warmup_bars"), self.warmup_bars))
+        except Exception:
+            pass
 
-    def equity(self, close):
-        return self.cash + self.position * close
+    def on_batch(self, batch):
+        seq = _as_int(batch.get("seq"), 0)
+        try:
+            orders = self._decide(batch, seq)
+        except Exception:
+            orders = []
+        if len(orders) > self.max_orders:
+            orders = orders[: self.max_orders]
+        return {"type": "reply", "seq": seq, "orders": orders}
 
-    def on_bar(self, bar):
-        close = float(bar["c"])
-        high = float(bar["h"])
-        low = float(bar["l"])
+    def _decide(self, batch, seq):
+        account = batch.get("account")
+        if not isinstance(account, dict):
+            account = {}
+        equity = max(0, _as_int(account.get("equity_quote_units"), 0))
+        positions = account.get("positions")
+        if not isinstance(positions, list):
+            positions = []
+        held_qty = None
+        for p in positions:
+            if not isinstance(p, dict) or p.get("symbol") != self.symbol:
+                continue
+            raw = p.get("qty")
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                continue
+            try:
+                q = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if q > 0:
+                held_qty = raw if isinstance(raw, str) else str(raw)
+                break
+        bars = batch.get("bars")
+        if not isinstance(bars, list):
+            bars = []
+        saw_bar = False
+        last_close = None
+        batch_high = None
+        cross_up = False
+        cross_dn = False
+        for bar in bars:
+            if not isinstance(bar, dict) or bar.get("symbol") != self.symbol:
+                continue
+            parsed = self._parse_bar(bar)
+            if parsed is None:
+                continue
+            c, h, l = parsed
+            saw_bar = True
+            self.n_bars += 1
+            fast = self.fast.update(c)
+            slow = self.slow.update(c)
+            self.atr.update(h, l, c)
+            gap = None
+            if fast is not None and slow is not None:
+                gap = fast - slow
+            if gap is not None and self.gap_prev is not None:
+                cross_up = gap > 0 and self.gap_prev <= 0
+                cross_dn = gap < 0 and self.gap_prev >= 0
+            else:
+                cross_up = False
+                cross_dn = False
+            if gap is not None:
+                self.gap_prev = gap
+            last_close = c
+            batch_high = c if batch_high is None else max(batch_high, c)
+        if not saw_bar:
+            return []
+        gated = seq < self.warmup_bars or self.n_bars < WARM_BARS
+        if held_qty is not None:
+            if self.entry_close is None:
+                self.entry_close = last_close
+                self.peak = batch_high
+                return []
+            self.peak = max(self.peak, batch_high)
+            if gated:
+                return []
+            stop = self.entry_close * (1.0 - HARD_STOP)
+            atr_now = self.atr.value
+            if atr_now is not None:
+                stop = max(stop, self.peak - TRAIL_ATR * atr_now)
+            if cross_dn or last_close <= stop:
+                self.entry_close = None
+                self.peak = None
+                return [self._sell(held_qty)]
+            return []
+        if gated or not cross_up:
+            return []
+        # Flat: current_value = qty*close*10^quote_scale // 10^(qty_scale+price_scale) = 0.
+        current_value = 0
+        room = self.max_weight_bps * equity // BPS - current_value
+        notional = equity * SIZE_NUM // SIZE_DEN
+        if notional > room:
+            notional = room
+        if notional <= 0 or notional < self.min_notional:
+            return []
+        self.entry_close = last_close
+        self.peak = last_close
+        return [self._buy(notional)]
 
-        self.bars_seen += 1
-        fast = self.fast.update(close)
-        slow = self.slow.update(close)
-        atr = self.atr.update(high, low, close)
+    @staticmethod
+    def _parse_bar(bar):
+        c = _as_float(bar.get("c"))
+        if c is None:
+            return None
+        h = _as_float(bar.get("h"))
+        if h is None:
+            h = c
+        l = _as_float(bar.get("l"))
+        if l is None:
+            l = c
+        return (c, h, l)
 
-        crossed_up = (self.prev_fast is not None
-                      and self.prev_fast <= self.prev_slow
-                      and fast > slow)
-        crossed_down = (self.prev_fast is not None
-                        and self.prev_fast >= self.prev_slow
-                        and fast < slow)
-        self.prev_fast = fast
-        self.prev_slow = slow
+    def _client_id(self):
+        cid = "o%d" % self._next_id
+        self._next_id += 1
+        return cid
 
-        orders = []
+    def _buy(self, notional):
+        return {
+            "side": "buy",
+            "client_id": self._client_id(),
+            "symbol": self.symbol,
+            "notional_quote_units": str(notional),
+            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+        }
 
-        # Manage the open position first: stops are evaluated every bar.
-        if self.position > 0:
-            if close > self.peak_close:
-                self.peak_close = close
-            trailing = self.peak_close - TRAIL_MULTIPLE * atr
-            hard = self.entry_price * (1.0 - HARD_STOP_PCT)
-            if close <= max(trailing, hard) or crossed_down:
-                orders.append({"side": "sell", "qty": round(self.position, 10)})
-                self.cash += self.position * close
-                self.position = 0.0
-                self.entry_price = None
-                self.peak_close = None
-
-        # New entry on a bullish EMA cross, once warmed up.
-        if (self.position == 0 and crossed_up
-                and self.bars_seen >= WARMUP_BARS):
-            qty = ENTRY_FRACTION * self.equity(close) / close
-            if qty > 0:
-                orders.append({"side": "buy", "qty": round(qty, 10)})
-                self.cash -= qty * close
-                self.position = qty
-                self.entry_price = close
-                self.peak_close = close
-
-        return orders
+    def _sell(self, qty):
+        return {
+            "side": "sell",
+            "client_id": self._client_id(),
+            "symbol": self.symbol,
+            "qty": qty,
+            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+        }
 
 
 def main():
     bot = Bot()
-    write = sys.stdout.write
-    for line in sys.stdin:
-        if not line.strip():
+    out = sys.stdout
+    src = getattr(sys.stdin, "buffer", sys.stdin)
+    for raw in src:
+        if isinstance(raw, bytes):
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        else:
+            line = raw
+        line = line.strip()
+        if not line:
             continue
         try:
-            bar = json.loads(line)
-            orders = bot.on_bar(bar)
-        except (ValueError, KeyError, TypeError):
-            # Malformed bar (bad JSON, missing field, non-numeric value):
-            # hold, leave the bot state untouched, and still emit exactly
-            # one output line so the 1:1 input/output contract holds.
-            # Safe: on_bar extracts and converts all fields before it
-            # mutates any state, so a failure here changes nothing.
-            orders = []
-        write(json.dumps({"orders": orders}) + "\n")
-        sys.stdout.flush()
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        mtype = msg.get("type")
+        if mtype == "hello":
+            try:
+                bot.on_hello(msg)
+            except Exception:
+                pass
+        elif mtype == "batch":
+            reply = bot.on_batch(msg)
+            try:
+                out.write(json.dumps(reply, separators=(",", ":"), ensure_ascii=False) + "\n")
+                out.flush()
+            except OSError:
+                return
+        elif mtype == "done":
+            try:
+                out.flush()
+            except OSError:
+                pass
+            return
+        # unknown message types: skip silently, no reply
 
 
 if __name__ == "__main__":
