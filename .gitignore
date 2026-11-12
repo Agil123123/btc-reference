@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+o1.jsonl
+o2.jsonl
+out*.jsonl
+transcripts.tar.gz
+usage.jsonl
+sample_bars.jsonl
